@@ -6,10 +6,11 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <pthread.h>
 
 #define KEYSIZE     1024
 #define PATHSIZE    16      // 文件名的大小
-#define M           8191   // B-Tree阶8K
+#define M           8191    // B-Tree阶8K
 #define POLISHING   4078
 
 #define INDEX_FILE_NAME "index_btree"   // 指向B-Tree root节点的文件名
@@ -23,7 +24,6 @@
 #define OPEN_FILE_READ(file_name, fp, mode, buf, size)      fp = OPEN_FILE(file_name, mode); fread(buf, size, 1, fp)
 #define OPEN_FILE_WRITE(file_name, fp, mode, buf, size)     fp = OPEN_FILE(file_name, mode); fwrite(buf, size, 1, fp)
 
-int BTreeNodeCount; // B-Tree节点计数
 
 // B-Tree里面key对应的value，存放原数据value的长度和在文件中的偏移量
 typedef struct {
@@ -41,7 +41,7 @@ typedef struct {
 typedef struct {
     uint16_t    keyNum;                 // 
     char        parent[PATHSIZE];       // 
-    char        polishing[POLISHING];   // 4K(补齐4K)
+    char        polishing[POLISHING];   // 4K(无用字段，补齐4K)
     char        key[M + 1][KEYSIZE];    // 8M
     char        ptr[M + 1][PATHSIZE];   // 128K
     Value       data[M + 1];            // 128K
@@ -64,6 +64,13 @@ static void writeNewFile(const char* file, void* buf, size_t size) {
     close(fd);
 }
 
+int     BuildingBTree;          // 1 表示正在构建B-Tree索引, 0 表示已构建B-Tree索引
+int     BTreeNodeCount;         // B-Tree节点计数
+int*    OpendFileCount;         // 已经打开文件的引用计数 
+BTreeNode**     OpendFilePtr;   // 为了已经打开的B-Tree节点对应的文件
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
+
 // 为B-Tree节点 生成文件名
 static void nextNodeFileName(char* buf) {
     buf[0] = 'n';
@@ -75,14 +82,58 @@ static void nextNodeFileName(char* buf) {
     BTreeNodeCount++;
 }
 
+static int getNodeId(const char* file) {
+    return atoi(file + 4);
+}
+
 // 建立B-Tree节点在内存中的映射
 static BTreeNode* MmapBTreeNode(const char* file) {
-    int fd = open(file, O_RDWR);
-    BTreeNode* nodeBuf = (BTreeNode*)mmap(NULL, sizeof(BTreeNode), PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    int         nodeId;
+    int         fd;
+    BTreeNode*  nodeBuf = NULL;
+
+    if (BuildingBTree == 0) {
+        nodeId = getNodeId(file);
+        pthread_mutex_lock(&mutex);
+        nodeBuf = OpendFilePtr[nodeId];
+        if (nodeBuf != NULL) {
+            OpendFileCount[nodeId]++;
+        }
+        pthread_mutex_unlock(&mutex);
+    }
+    if (nodeBuf == NULL) {
+        return nodeBuf;
+    }
+    
+    fd = open(file, O_RDWR);
+    nodeBuf = (BTreeNode*)mmap(NULL, sizeof(BTreeNode), PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+
+    if (BuildingBTree == 0) {
+        pthread_mutex_lock(&mutex);
+        OpendFilePtr[nodeId] = nodeBuf;
+        OpendFileCount[nodeId] = 1;
+        pthread_mutex_unlock(&mutex);
+    }
     return nodeBuf;
 }
 
-static void MunmapBTreeNode(BTreeNode* nodeBuf) {
+static void MunmapBTreeNode(BTreeNode* nodeBuf, char* file) {
+    int nodeId;
+    if (BuildingBTree == 0) {
+        nodeId = getNodeId(file);
+        pthread_mutex_lock(&mutex);
+        OpendFileCount[nodeId]--;
+        if (OpendFileCount[nodeId] == 0) {
+            OpendFilePtr[nodeId] = NULL;
+        }else {
+            nodeBuf = NULL;
+        }
+        pthread_mutex_unlock(&mutex);
+    }
+
+    if (nodeBuf == NULL) {
+        return;
+    }
     munmap(nodeBuf, sizeof(BTreeNode));
 }
 
@@ -119,7 +170,7 @@ static void SearchBTree(char* file, char* key, Result* r) {
             strcpy(parentFile, nodeFile);
             strcpy(nodeFile, nodeBuf->ptr[i - 1]);
         }
-        MunmapBTreeNode(nodeBuf);
+        MunmapBTreeNode(nodeBuf, file);
     }
 
     if (found == 1) {
@@ -162,11 +213,11 @@ static void NewRootNode(char* rootFile, char* key, char* ap, Value data) {
 
     nodeBuf = MmapBTreeNode(rootFile);
     strcpy(nodeBuf->parent, newRootFileName);
-    MunmapBTreeNode(nodeBuf);
+    MunmapBTreeNode(nodeBuf, rootFile);
 
-    nodeBuf = MmapBTreeNode(rootFile);
+    nodeBuf = MmapBTreeNode(ap);
     strcpy(nodeBuf->parent, newRootFileName);
-    MunmapBTreeNode(nodeBuf);
+    MunmapBTreeNode(nodeBuf, ap);
 
     UpdateFileHead(newRootFileName);
 }
@@ -197,7 +248,7 @@ static void Split(BTreeNode* nodeBuf, char* ap, uint16_t s) {
         if (apNodeBuf->ptr[i][0] != 0) {
             apNodeBufChild = MmapBTreeNode(apNodeBuf->ptr[i]);
             strcpy(apNodeBufChild->parent, ap);
-            MunmapBTreeNode(apNodeBufChild);
+            MunmapBTreeNode(apNodeBufChild, apNodeBuf->ptr[i]);
         }
     }
 
@@ -238,7 +289,7 @@ static void InsertBTree(char* rootNodeFile, char* ikey, char* nodeFile, uint16_t
     while (needNewRoot == 0 && finished == 0) {
         Insert(nodeBuf, i, key, ap, data);
         if (nodeBuf->keyNum < M) {
-            MunmapBTreeNode(nodeBuf);
+            MunmapBTreeNode(nodeBuf, nodeFile);
             finished = 1;
         } else {
             s = (M + 1)/2;
@@ -248,8 +299,8 @@ static void InsertBTree(char* rootNodeFile, char* ikey, char* nodeFile, uint16_t
             data.pos = nodeBuf->data[s].pos;
 
             if (nodeBuf->parent[0] != 0) {
+                MunmapBTreeNode(nodeBuf, nodeFile);
                 strcpy(nodeFile, nodeBuf->parent);
-                MunmapBTreeNode(nodeBuf);
                 nodeBuf = MmapBTreeNode(nodeFile);
                 i = Search(nodeBuf, key);
             } else {
@@ -298,6 +349,7 @@ static int createIndexHeadFile() {
 
 // 建立B-Tree
 void createIndex() {
+    BuildingBTree = 1;
     if (createIndexHeadFile()) {
         return;
     }
@@ -333,8 +385,18 @@ void createIndex() {
         offset += lv;
     }
     munmap(buf, size);
+    
+    OpendFileCount = (int*)malloc(sizeof(int)*BTreeNodeCount);
+    OpendFilePtr = (BTreeNode**)malloc(sizeof(BTreeNode*)*BTreeNodeCount);
+    BuildingBTree = 0;
 }
 
+// 1. 调用read之前，调用createIndex建立索引
+// 2. 返回的value指针对应的内存空间需要free
+// 3. 可以通过pthread_create 创建多个线程调用read函数并行读取数据
+// 4. 在并行read过程中，避免已经mmap的文件又被mmap，
+// 在OpendFilePtr中保存已经mmap的文件的指针,
+// 在OpendFileCount中保存已经打开文件的引用计数。
 char* read(char* key) {
     FILE* fp;
     char* res;
